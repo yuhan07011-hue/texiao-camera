@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="特效相机">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="manifest" href="manifest.json">
+<title>特效相机</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#000;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+#v{display:none}
+#c{display:block;position:fixed;top:0;left:0;width:100%;height:100%}
+#mc{position:fixed;top:-9999px;left:-9999px;pointer-events:none}
+#controls{
+  position:fixed;z-index:10;display:flex;align-items:center;justify-content:center;
+  pointer-events:none
+}
+#controls > *{pointer-events:auto}
+/* 竖屏：底部排列 */
+@media(orientation:portrait){
+  #controls{bottom:40px;left:0;right:0;flex-direction:row;gap:40px}
+}
+/* 横屏：右侧排列 */
+@media(orientation:landscape){
+  #controls{right:30px;top:50%;transform:translateY(-50%);flex-direction:column;gap:24px}
+}
+#controls button{
+  border:none;cursor:pointer;outline:none;display:flex;align-items:center;justify-content:center;
+  -webkit-tap-highlight-color:transparent;touch-action:manipulation;transition:all .15s;
+  background:transparent
+}
+#controls button:active{transform:scale(0.92)}
+
+/* 快门按钮 */
+#btn-photo{
+  width:72px;height:72px;border-radius:50%;
+  border:4px solid #fff!important;
+  background:rgba(255,255,255,0.15)!important;
+  box-shadow:0 0 0 6px rgba(255,255,255,0.25)
+}
+#btn-photo::after{
+  content:'';width:58px;height:58px;border-radius:50%;background:#fff
+}
+#btn-photo:active{transform:scale(0.88)}
+
+/* 翻转摄像头按钮 */
+#btn-flip{
+  width:44px;height:44px;border-radius:50%;
+  background:rgba(255,255,255,0.12)!important;
+  backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)
+}
+#btn-flip::after{
+  content:'';width:20px;height:20px;
+  border:2px solid #fff;border-radius:4px;
+  box-shadow:-4px -4px 0 -4px #fff, 2px 2px 0 -3px #fff;
+  transform:rotate(-30deg)
+}
+/* flip 内部小圆 */
+#btn-flip::before{
+  content:'';position:absolute;width:4px;height:4px;border-radius:50%;background:#fff;
+  margin-top:-6px;margin-left:6px;z-index:1
+}
+
+/* 录制按钮 */
+#btn-record{
+  width:44px;height:44px;border-radius:50%;
+  background:rgba(255,255,255,0.12)!important;
+  backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)
+}
+@keyframes recordPulse{0%,100%{box-shadow:0 0 0 0 rgba(255,60,60,0.6)}50%{box-shadow:0 0 0 8px rgba(255,60,60,0)}}
+#btn-record::after{
+  content:'';width:12px;height:12px;border-radius:3px;background:#ff4040;
+  transition:border-radius .2s,width .2s,height .2s,background .2s
+}
+#btn-record.recording::after{
+  width:16px;height:16px;border-radius:50%;background:#ff2020
+}
+#btn-record.recording{
+  animation:recordPulse 1.2s infinite;
+  background:rgba(255,60,60,0.2)!important
+}
+#toast{
+  position:fixed;z-index:200;top:50%;left:50%;transform:translate(-50%,-50%);
+  background:rgba(0,0,0,0.75);color:#fff;padding:10px 20px;border-radius:20px;
+  font-size:14px;pointer-events:none;opacity:0;transition:opacity .3s
+}
+#toast.show{opacity:1}
+#loading{
+  position:fixed;z-index:50;top:50%;left:50%;transform:translate(-50%,-50%);
+  color:#fff;font-size:16px;text-align:center
+}
+#loading .spinner{
+  width:40px;height:40px;border:3px solid rgba(255,255,255,0.2);border-top-color:#fff;
+  border-radius:50%;margin:0 auto 12px;animation:spin .8s linear infinite
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline webkit-playsinline muted></video>
+<canvas id="c"></canvas>
+<canvas id="mc"></canvas>
+<div id="loading"><div class="spinner"></div>加载特效相机...</div>
+<div id="controls">
+  <button id="btn-record" class="btn-record" title="录制"></button>
+  <button id="btn-photo" title="拍照"></button>
+  <button id="btn-flip" title="翻转摄像头"></button>
+</div>
+<div id="toast"></div>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1.1675465747/selfie_segmentation.js" crossorigin="anonymous"></script>
+<script>
+(function(){
+"use strict";
+
+const video = document.getElementById('v');
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const maskCanvas = document.getElementById('mc');
+const maskCtx = maskCanvas.getContext('2d');
+const blurCanvas = document.createElement('canvas');
+const blurCtx = blurCanvas.getContext('2d');
+const loading = document.getElementById('loading');
+const toast = document.getElementById('toast');
+
+// ============ 状态 ============
+let facingMode = 'user';
+let isRecording = false;
+let mediaRecorder = null;
+let recordedChunks = [];
+let stream = null;
+let animationId = null;
+let lastSegTime = 0;
+const SEG_INTERVAL = 33;
+
+let videoCrop = { sx: 0, sy: 0, sw: 640, sh: 480 };
+
+let maskPixels = null;
+let faceCenter = {x: 0, y: 0, valid: false};
+
+// ============ 粒子 ============
+let particles = [];
+let splashParticles = [];
+const SPAWN_MIN = 40, SPAWN_MAX = 60;
+const POOL_MAX = 1200;
+const SPLASH_MAX = 400;
+let gravityX = 0, gravityY = 1; // 屏幕坐标下的重力方向
+
+// ============ 重力方向 ============
+let orientationGranted = false;
+function handleOrientation(event){
+	const gamma = event.gamma || 0;
+	const gRad = gamma * Math.PI / 180;
+	const rawGX = Math.sin(gRad);
+	const rawGY = Math.cos(gRad);
+	const w = canvas.width, h = canvas.height;
+	if(w > h){ gravityX = 0; gravityY = 1; }
+	else { gravityX = rawGX; gravityY = rawGY; }
+}
+function requestOrientation(){
+	if(orientationGranted) return;
+	if(typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
+		DeviceOrientationEvent.requestPermission().then(p => {
+			if(p === 'granted'){ orientationGranted = true; window.addEventListener('deviceorientation', handleOrientation); }
+		}).catch(() => {});
+	} else if('DeviceOrientationEvent' in window){
+		orientationGranted = true;
+		window.addEventListener('deviceorientation', handleOrientation);
+	}
+}
+
+// ============ Toast ============
+let toastTimer;
+function showToast(msg, dur=1500){
+  toast.textContent = msg; toast.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove('show'), dur);
+}
+
+// ============ Canvas & 视频裁剪 ============
+function computeVideoCrop(){
+  if(!video.videoWidth || !video.videoHeight) return;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const cw = canvas.width, ch = canvas.height;
+  if(cw <= 0 || ch <= 0) return;
+  const vr = vw / vh, cr = cw / ch;
+  if(vr > cr){
+    videoCrop.sh = vh;
+    videoCrop.sw = Math.round(vh * cr);
+    videoCrop.sx = Math.round((vw - videoCrop.sw) / 2);
+    videoCrop.sy = 0;
+  } else {
+    videoCrop.sw = vw;
+    videoCrop.sh = Math.round(vw / cr);
+    videoCrop.sx = 0;
+    videoCrop.sy = Math.round((vh - videoCrop.sh) / 2);
+  }
+}
+
+function resizeCanvas(){
+  const vp = window.visualViewport;
+  const w = Math.round(vp ? vp.width : window.innerWidth);
+  const h = Math.round(vp ? vp.height : window.innerHeight);
+  console.log('resizeCanvas检查', {当前canvasW:canvas.width,当前canvasH:canvas.height,视口W:w,视口H:h});
+  if(w === canvas.width && h === canvas.height) return;
+  canvas.width = w;
+  canvas.height = h;
+  ctx.setTransform(1,0,0,1,0,0);
+  maskCanvas.width = w;
+  maskCanvas.height = h;
+  blurCanvas.width = w;
+  blurCanvas.height = h;
+  computeVideoCrop();
+  maskPixels = null;
+  for(const p of particles){ p.x = Math.random() * w; p.y = Math.random() * h; }
+  for(const s of splashParticles){ s.x = Math.random() * w; s.y = Math.random() * h; }
+}
+
+function handleResize(){
+  setTimeout(resizeCanvas, 300);
+}
+
+// ============ 摄像头 ============
+async function startCamera(){
+  if(stream){ stream.getTracks().forEach(t => t.stop()); }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode, width:{ideal:640}, height:{ideal:480} }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+  } catch(e){ showToast('无法访问摄像头'); console.error(e); }
+}
+async function flipCamera(){
+  facingMode = facingMode === 'user' ? 'environment' : 'user';
+  maskPixels = null;
+  particles = []; splashParticles = [];
+  await startCamera();
+}
+document.getElementById('btn-flip').addEventListener('click', flipCamera);
+
+// ============ 拍照 / 录制 ============
+async function saveToGallery(blob, fileName, type){
+  try {
+    if(navigator.share && navigator.canShare && navigator.canShare({files:[new File([blob], fileName, {type})]})){
+      const file = new File([blob], fileName, {type});
+      await navigator.share({files:[file], title:'特效相机'});
+      showToast('已保存至相册');
+      return;
+    }
+  } catch(e){ if(e.name !== 'AbortError') console.error(e); }
+  const a = document.createElement('a'); a.download = fileName;
+  a.href = URL.createObjectURL(blob); a.click(); URL.revokeObjectURL(a.href);
+  showToast('已保存');
+}
+document.getElementById('btn-photo').addEventListener('click', () => {
+  canvas.toBlob(blob => { if(!blob) return; saveToGallery(blob, `特效相机_${Date.now()}.png`, 'image/png'); }, 'image/png');
+});
+document.getElementById('btn-record').addEventListener('click', () => { if(!isRecording) startRecording(); else stopRecording(); });
+function startRecording(){
+  const cStream = canvas.captureStream(30);
+  const mts = ['video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'];
+  let mt = ''; for(const m of mts){ if(MediaRecorder.isTypeSupported(m)){ mt = m; break; } }
+  if(!mt){ showToast('浏览器不支持录制'); return; }
+  recordedChunks = [];
+  mediaRecorder = new MediaRecorder(cStream, { mimeType: mt });
+  mediaRecorder.ondataavailable = e => { if(e.data.size>0) recordedChunks.push(e.data); };
+  mediaRecorder.onstop = () => {
+    const blob = new Blob(recordedChunks, {type: mt});
+    saveToGallery(blob, `特效相机_${Date.now()}.webm`, 'video/webm');
+  };
+  mediaRecorder.start(); isRecording = true;
+  document.getElementById('btn-record').classList.add('recording'); showToast('开始录制');
+}
+function stopRecording(){
+if(mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+isRecording = false; document.getElementById('btn-record').classList.remove('recording');
+}
+
+// ============ MediaPipe ============
+let selfieSegmentation = null;
+async function initSegmentation(){
+  if(typeof SelfieSegmentation === 'undefined'){ throw new Error('MediaPipe 未加载'); }
+  selfieSegmentation = new SelfieSegmentation({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`
+  });
+  selfieSegmentation.setOptions({ modelSelection: 1 });
+  selfieSegmentation.onResults(onSegResults);
+  console.log('MediaPipe 开始加载模型...');
+  await selfieSegmentation.initialize();
+  console.log('MediaPipe 模型加载完成');
+}
+function onSegResults(results){
+  console.log('MediaPipe回调触发', results.segmentationMask ? 'mask有数据' : 'mask为空');
+  if(!results.segmentationMask) return;
+  if(canvas.width <= 0 || canvas.height <= 0) return;
+  const cw = canvas.width, ch = canvas.height;
+  if(maskCanvas.width !== cw || maskCanvas.height !== ch){
+    maskCanvas.width = cw; maskCanvas.height = ch;
+  }
+  const {sx, sy, sw, sh} = videoCrop;
+  maskCtx.clearRect(0, 0, cw, ch);
+  if(facingMode === 'user'){
+    maskCtx.save();
+    maskCtx.translate(cw, 0);
+    maskCtx.scale(-1, 1);
+    maskCtx.drawImage(results.segmentationMask, sx, sy, sw, sh, 0, 0, cw, ch);
+    maskCtx.restore();
+  } else {
+    maskCtx.drawImage(results.segmentationMask, sx, sy, sw, sh, 0, 0, cw, ch);
+  }
+  try { const img = maskCtx.getImageData(0, 0, cw, ch); maskPixels = img.data; }
+  catch(e){ maskPixels = null; }
+  if(maskPixels){
+    let sx = 0, sy = 0, n = 0;
+    const limit = Math.floor(cw * ch * 0.6) * 4;
+    for(let i = 0; i < limit; i += 4){
+      if(maskPixels[i] > 200){ sx += (i/4) % cw; sy += Math.floor((i/4)/cw); n++; }
+    }
+    if(n > 100){ faceCenter = {x: sx/n, y: sy/n, valid: true}; }
+    else { faceCenter.valid = false; }
+  }
+}
+
+// ============ 人物检测 ============
+function isHuman(x, y){
+  if(!maskPixels) return false;
+  const ix = Math.floor(x), iy = Math.floor(y);
+  if(ix < 0 || ix >= canvas.width || iy < 0 || iy >= canvas.height) return false;
+  return maskPixels[(iy * canvas.width + ix) * 4] > 200;
+}
+
+function isNearEdge(x, y){
+  const d = 3;
+  for(let dy = -d; dy <= d; dy++)
+    for(let dx = -d; dx <= d; dx++)
+      if(!isHuman(x + dx, y + dy)) return true;
+  return false;
+}
+
+// ============ 弹溅粒子 ============
+function spawnSplash(x, y){
+  const room = SPLASH_MAX - splashParticles.length;
+  if(room <= 0) return;
+  const count = Math.min(3 + Math.floor(Math.random() * 3), room);
+  const baseAngle = Math.atan2(-gravityY, -gravityX);
+  for(let i = 0; i < count; i++){
+    const spread = Math.PI * 0.66;
+    const angle = baseAngle - spread/2 + Math.random() * spread;
+    const speed = 40 + Math.random() * 100;
+    splashParticles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      size: 1 + Math.random(),
+      life: 15 + Math.floor(Math.random() * 6),
+      maxLife: 15 + Math.floor(Math.random() * 6)
+    });
+  }
+}
+
+// ============ 粒子生成 ============
+function spawnOne(){
+  const w = canvas.width, h = canvas.height;
+  const band = 50, margin = 8;
+  const gxAbs = Math.abs(gravityX), gyAbs = Math.abs(gravityY);
+  const total = gxAbs + gyAbs || 1;
+  let x, y;
+  if(Math.random() * total < gxAbs){
+    x = gravityX > 0 ? -margin - Math.random() * band : w + margin + Math.random() * band;
+    y = Math.random() * h;
+  } else {
+    y = gravityY > 0 ? -margin - Math.random() * band : h + margin + Math.random() * band;
+    x = Math.random() * w;
+  }
+  particles.push({
+    x, y,
+    speed: 2 + Math.random() * 3,
+    size: 1.5 + Math.random() * 1.5,
+    wasInPerson: false, stuck: false, life: 0, maxLife: 0
+  });
+}
+
+// ============ 粒子更新 ============
+function updateParticles(){
+  const h = canvas.height, w = canvas.width;
+  const gx = gravityX, gy = gravityY;
+  const STUCK_LIFE = 240;
+
+  for(let i = particles.length - 1; i >= 0; i--){
+    const p = particles[i];
+
+    if(p.stuck){
+      if(!isHuman(p.x, p.y)) p.life = Math.min(p.life, 4);
+      else p.atEdge = isNearEdge(p.x, p.y);
+      p.life--;
+      if(p.life <= 0){ particles.splice(i, 1); }
+      continue;
+    }
+
+    p.x += gx * p.speed;
+    p.y += gy * p.speed;
+
+    if(p.y > h + 10 || p.y < -10 || p.x < -50 || p.x > w + 50){
+      particles.splice(i, 1); continue;
+    }
+
+    if(isHuman(p.x, p.y)){
+      if(isNearEdge(p.x, p.y)){
+        p.stuck = true;
+        p.life = STUCK_LIFE;
+        p.maxLife = STUCK_LIFE;
+        p.atEdge = true;
+      } else {
+        particles.splice(i, 1);
+      }
+      continue;
+    }
+  }
+
+  for(let i = splashParticles.length - 1; i >= 0; i--){
+    const s = splashParticles[i];
+    s.life--;
+    if(s.life <= 0){ splashParticles.splice(i, 1); continue; }
+    s.x += s.vx;
+    s.y += s.vy;
+    s.vy += gy * 2;
+    s.vx += gx * 2;
+  }
+}
+
+// ============ 粒子绘制 ============
+function drawParticles(){
+  const visible = [];
+  for(let i = 0; i < particles.length; i++){
+    const p = particles[i];
+    if(!p.stuck && !isHuman(p.x, p.y)) visible.push(p);
+  }
+  if(visible.length > 0){
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    for(let i = 0; i < visible.length; i++){
+      const p = visible[i];
+      ctx.moveTo(p.x + p.size, p.y);
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+    }
+    ctx.fill();
+  }
+
+  for(let i = 0; i < particles.length; i++){
+    const p = particles[i];
+    if(!p.stuck) continue;
+    if(isHuman(p.x, p.y) && !p.atEdge) continue;
+    const t = p.life / p.maxLife;
+    ctx.globalAlpha = Math.pow(t, 0.18);
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  for(let i = 0; i < splashParticles.length; i++){
+    const s = splashParticles[i];
+    const alpha = s.life / s.maxLife;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ============ 主循环 ============
+
+function render(timestamp){
+  animationId = requestAnimationFrame(render);
+
+  // 每帧检测视口尺寸变化（旋转时事件可能不可靠）
+  const vp = window.visualViewport;
+  const vw = Math.round(vp ? vp.width : window.innerWidth);
+  const vh = Math.round(vp ? vp.height : window.innerHeight);
+  if(vw !== canvas.width || vh !== canvas.height){
+    resizeCanvas();
+  }
+
+  if(video.videoWidth) computeVideoCrop();
+
+  if(video.readyState >= 2 && selfieSegmentation && timestamp - lastSegTime > SEG_INTERVAL){
+    lastSegTime = timestamp;
+    try { selfieSegmentation.send({image: video}).catch(e => console.error('MediaPipe send 失败:', e)); } catch(e){ console.error('MediaPipe send 异常:', e); }
+  }
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if(video.readyState >= 2){
+    const {sx, sy, sw, sh} = videoCrop;
+    if(facingMode === 'user'){
+      ctx.save(); ctx.translate(canvas.width, 0); ctx.scale(-1, 1);
+      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+      ctx.restore();
+    } else {
+      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    }
+  }
+
+  // 20% skin smoothing on person areas
+  if(maskPixels && blurCanvas.width === canvas.width){
+    const {sx, sy, sw, sh} = videoCrop;
+    blurCtx.filter = 'blur(8px)';
+    if(facingMode === 'user'){
+      blurCtx.save(); blurCtx.translate(canvas.width, 0); blurCtx.scale(-1, 1);
+      blurCtx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+      blurCtx.restore();
+    } else {
+      blurCtx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    }
+    blurCtx.filter = 'none';
+    blurCtx.save();
+    blurCtx.globalCompositeOperation = 'destination-in';
+    blurCtx.drawImage(maskCanvas, 0, 0);
+    blurCtx.restore();
+    ctx.save();
+    ctx.globalAlpha = 0.4;
+    ctx.drawImage(blurCanvas, 0, 0);
+    ctx.restore();
+  }
+
+  // 30% face slimming
+  if(faceCenter.valid && maskPixels){
+    const w = canvas.width, h = canvas.height;
+    const cx = faceCenter.x, cy = faceCenter.y;
+    const radius = Math.min(w, h) * 0.22;
+    const strength = 0.04;
+    const x0 = Math.max(0, Math.floor(cx - radius - 2));
+    const y0 = Math.max(0, Math.floor(cy - radius - 2));
+    const x1 = Math.min(w, Math.ceil(cx + radius + 2));
+    const y1 = Math.min(h, Math.ceil(cy + radius + 2));
+    const rw = x1 - x0, rh = y1 - y0;
+    try {
+      const imgData = ctx.getImageData(x0, y0, rw, rh);
+      const src = imgData.data;
+      const dst = new Uint8ClampedArray(src.length);
+      for(let dy = 0; dy < rh; dy++){
+        for(let dx = 0; dx < rw; dx++){
+          const gx = x0 + dx, gy = y0 + dy;
+          const dist = Math.sqrt((gx-cx)**2 + (gy-cy)**2);
+          const di = (dy * rw + dx) * 4;
+          if(dist >= radius || maskPixels[(gy*w+gx)*4] <= 200){
+            dst[di]=src[di]; dst[di+1]=src[di+1]; dst[di+2]=src[di+2]; dst[di+3]=src[di+3];
+            continue;
+          }
+          const falloff = 1 - dist/radius;
+          const s = 1 + strength * falloff;
+          const sx = cx + (gx - cx) * s;
+          const sy = cy + (gy - cy) * s;
+          const six = Math.max(0, Math.min(w-1, Math.round(sx)));
+          const siy = Math.max(0, Math.min(h-1, Math.round(sy)));
+          if(six>=x0 && six<x1 && siy>=y0 && siy<y1){
+            const si = ((siy-y0) * rw + (six-x0)) * 4;
+            dst[di]=src[si]; dst[di+1]=src[si+1]; dst[di+2]=src[si+2]; dst[di+3]=src[si+3];
+          } else {
+            const gi = (siy * w + six) * 4;
+            dst[di]=maskPixels[gi]||0; dst[di+1]=maskPixels[gi+1]||0; dst[di+2]=maskPixels[gi+2]||0; dst[di+3]=255;
+          }
+        }
+      }
+      ctx.putImageData(new ImageData(dst, rw, rh), x0, y0);
+    } catch(e){}
+  }
+
+  updateParticles();
+
+  const count = SPAWN_MIN + Math.floor(Math.random() * (SPAWN_MAX - SPAWN_MIN + 1));
+  const room = Math.max(0, POOL_MAX - particles.length);
+  if(room > 0) { const n = Math.min(count, room); for(let i = 0; i < n; i++) spawnOne(); }
+
+  drawParticles();
+}
+
+// ============ 初始化 ============
+async function init(){
+  try {
+    await Promise.all([startCamera(), initSegmentation()]);
+    loading.style.display = 'none';
+    requestOrientation();
+    resizeCanvas();
+    window.addEventListener('resize', handleResize);
+    window.addEventListener('orientationchange', handleResize);
+    screen.orientation?.addEventListener('change', handleResize);
+    window.visualViewport?.addEventListener('resize', handleResize);
+    new ResizeObserver(() => { resizeCanvas(); }).observe(canvas);
+    animationId = requestAnimationFrame(render);
+    showToast('粒子倾泻已就绪', 2000);
+  } catch(e){
+    loading.innerHTML = `<div style="color:#f44;font-size:16px">初始化失败<br><small>${e.message}</small><br><br><button onclick="location.reload()" style="padding:10px 24px;border-radius:20px;border:none;background:#fff;color:#000;font-size:15px;cursor:pointer">重试</button></div>`;
+    console.error(e);
+  }
+}
+document.addEventListener('touchmove', e => { e.preventDefault(); }, {passive: false});
+document.addEventListener('click', requestOrientation);
+document.addEventListener('touchend', requestOrientation);
+init();
+})();
+</script>
+</body>
+</html>
